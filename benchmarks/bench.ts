@@ -20,10 +20,19 @@
  *   pnpm bench -- --json              # write results.json
  *   pnpm bench -- --branch my-branch  # override native branch (default: ctate/native-2)
  *   pnpm bench -- --vcpus 8           # sandbox vCPUs (default: 8, higher = faster Rust build)
+ *
+ * Local/CI adaptation (bench-local branch): commands run as local child
+ * processes instead of inside a Vercel Sandbox, so no Vercel credentials
+ * are needed. The native daemon is built from the checked-out repository
+ * (cli/) rather than a fresh clone, system packages are installed with
+ * apt-get, and --scenario <name> runs a single scenario.
+ *   npx tsx bench.ts --scenario navigate --json
  */
 
-import { Sandbox } from "@vercel/sandbox";
+import { spawn } from "child_process";
 import { readFileSync, writeFileSync } from "fs";
+import { cpus } from "os";
+import { join } from "path";
 import { scenarios, type Scenario } from "./scenarios.js";
 
 // ---------------------------------------------------------------------------
@@ -52,18 +61,7 @@ function loadEnv() {
 }
 loadEnv();
 
-const credentials = {
-  token: process.env.SANDBOX_VERCEL_TOKEN!,
-  teamId: process.env.SANDBOX_VERCEL_TEAM_ID!,
-  projectId: process.env.SANDBOX_VERCEL_PROJECT_ID!,
-};
-
-if (!credentials.token || !credentials.teamId || !credentials.projectId) {
-  console.error(
-    "Missing credentials. Set SANDBOX_VERCEL_TOKEN, SANDBOX_VERCEL_TEAM_ID, SANDBOX_VERCEL_PROJECT_ID in .env",
-  );
-  process.exit(1);
-}
+// Local execution: no Vercel Sandbox credentials are required.
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -74,8 +72,9 @@ function parseArgs() {
   let iterations = 10;
   let warmup = 1;
   let json = false;
-  let branch = "ctate/native-2";
-  let vcpus = 8;
+  let branch = "main";
+  let vcpus = cpus().length;
+  let scenario: string | null = null;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--iterations" && args[i + 1]) {
@@ -88,10 +87,12 @@ function parseArgs() {
       branch = args[++i];
     } else if (args[i] === "--vcpus" && args[i + 1]) {
       vcpus = parseInt(args[++i], 10);
+    } else if (args[i] === "--scenario" && args[i + 1]) {
+      scenario = args[++i];
     }
   }
 
-  return { iterations, warmup, json, branch, vcpus };
+  return { iterations, warmup, json, branch, vcpus, scenario };
 }
 
 const config = parseArgs();
@@ -100,43 +101,82 @@ const config = parseArgs();
 // Constants
 // ---------------------------------------------------------------------------
 
-const TIMEOUT_MS = 30 * 60 * 1000;
-const REPO_URL = "https://github.com/vercel-labs/agent-browser.git";
+// bench.ts runs from the benchmarks/ directory (as in the README), so the
+// repository root is one level up.
+const REPO_ROOT = join(process.cwd(), "..");
 
+// apt (Debian/Ubuntu) equivalents of the upstream dnf package list.
 const CHROMIUM_SYSTEM_DEPS = [
-  "nss",
-  "nss-tools",
-  "nspr",
-  "libxkbcommon",
-  "atk",
-  "at-spi2-atk",
-  "at-spi2-core",
-  "libXcomposite",
-  "libXdamage",
-  "libXrandr",
-  "libXfixes",
-  "libXcursor",
-  "libXi",
-  "libXtst",
-  "libXScrnSaver",
-  "libXext",
-  "mesa-libgbm",
-  "libdrm",
-  "mesa-libGL",
-  "mesa-libEGL",
-  "cups-libs",
-  "alsa-lib",
-  "pango",
-  "cairo",
-  "gtk3",
-  "dbus-libs",
+  "libnss3",
+  "libnss3-tools",
+  "libnspr4",
+  "libxkbcommon0",
+  "libatk1.0-0",
+  "libatk-bridge2.0-0",
+  "libatspi2.0-0",
+  "libxcomposite1",
+  "libxdamage1",
+  "libxrandr2",
+  "libxfixes3",
+  "libxcursor1",
+  "libxi6",
+  "libxtst6",
+  "libxss1",
+  "libxext6",
+  "libgbm1",
+  "libdrm2",
+  "libgl1",
+  "libegl1",
+  "libcups2",
+  "libasound2",
+  "libpango-1.0-0",
+  "libcairo2",
+  "libgtk-3-0",
+  "libdbus-1-3",
 ];
 
 // ---------------------------------------------------------------------------
-// Sandbox helpers
+// Local command execution (replaces the Vercel Sandbox layer)
 // ---------------------------------------------------------------------------
 
-type SandboxInstance = InstanceType<typeof Sandbox>;
+interface CommandResult {
+  exitCode: number;
+  stdout(): Promise<string>;
+  stderr(): Promise<string>;
+}
+
+class LocalMachine {
+  async runCommand(
+    cmdOrOpts:
+      | string
+      | { cmd: string; args?: string[]; env?: Record<string, string> },
+    args: string[] = [],
+  ): Promise<CommandResult> {
+    const cmd = typeof cmdOrOpts === "string" ? cmdOrOpts : cmdOrOpts.cmd;
+    const argv = typeof cmdOrOpts === "string" ? args : (cmdOrOpts.args ?? []);
+    const env = typeof cmdOrOpts === "string" ? undefined : cmdOrOpts.env;
+
+    return new Promise((resolve, reject) => {
+      const child = spawn(cmd, argv, {
+        env: { ...process.env, ...(env ?? {}) },
+      });
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (d) => (out += d.toString()));
+      child.stderr.on("data", (d) => (err += d.toString()));
+      child.on("error", reject);
+      child.on("close", (code) =>
+        resolve({
+          exitCode: code ?? -1,
+          stdout: async () => out,
+          stderr: async () => err,
+        }),
+      );
+    });
+  }
+}
+
+type SandboxInstance = LocalMachine;
 
 async function run(
   sandbox: SandboxInstance,
@@ -578,9 +618,12 @@ async function benchmarkDaemon(
   console.log(`  Binary size: ${formatBytes(binarySizeBytes)}`);
   console.log(`  Distribution size: ${formatBytes(distributionSizeBytes)}`);
 
-  // Run all scenarios
+  // Run all scenarios (or the single --scenario selection)
+  const selected = config.scenario
+    ? scenarios.filter((s) => s.name === config.scenario)
+    : scenarios;
   const results: ScenarioResult[] = [];
-  for (const scenario of scenarios) {
+  for (const scenario of selected) {
     process.stdout.write(`  ${scenario.name} `);
     const result = await runScenario(
       sandbox,
@@ -645,10 +688,13 @@ async function benchmarkDaemon(
 
 async function installChromiumDeps(sandbox: SandboxInstance) {
   console.log("Installing Chromium system dependencies...");
-  await shell(
-    sandbox,
-    `sudo dnf clean all 2>&1 && sudo dnf install -y --skip-broken ${CHROMIUM_SYSTEM_DEPS.join(" ")} 2>&1 && sudo ldconfig 2>&1`,
-  );
+  // apt equivalent of the upstream dnf install; the per-package best
+  // effort mirrors dnf's --skip-broken.
+  await shell(sandbox, `sudo apt-get update 2>&1`);
+  for (const pkg of CHROMIUM_SYSTEM_DEPS) {
+    await shellSafe(sandbox, `sudo apt-get install -y ${pkg} 2>&1 || true`);
+  }
+  await shellSafe(sandbox, `sudo ldconfig 2>&1 || true`);
 }
 
 async function installNodeDaemon(sandbox: SandboxInstance) {
@@ -660,33 +706,25 @@ async function installNodeDaemon(sandbox: SandboxInstance) {
 }
 
 async function installNativeDaemon(sandbox: SandboxInstance, branch: string) {
-  console.log(`\nBuilding native daemon from ${branch}...`);
+  console.log(`\nBuilding native daemon from ${branch} (checked-out tree)...`);
 
   console.log("  Installing build tools and Rust toolchain...");
   const rustStart = Date.now();
   await shell(
     sandbox,
-    "sudo dnf install -y gcc gcc-c++ make perl-core openssl-devel 2>&1",
+    "sudo apt-get install -y gcc g++ make perl pkg-config libssl-dev 2>&1",
   );
   await shell(
     sandbox,
-    "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y 2>&1",
+    "command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y 2>&1",
   );
   console.log(`  Rust + build tools installed (${Math.round((Date.now() - rustStart) / 1000)}s)`);
-
-  console.log(`  Cloning repo (branch: ${branch})...`);
-  const cloneStart = Date.now();
-  await shell(
-    sandbox,
-    `git clone --depth 1 --branch ${branch} ${REPO_URL} /tmp/agent-browser 2>&1`,
-  );
-  console.log(`  Cloned (${Math.round((Date.now() - cloneStart) / 1000)}s)`);
 
   console.log("  Building release binary (cargo build --release)...");
   const buildStart = Date.now();
   await shell(
     sandbox,
-    "source $HOME/.cargo/env && cd /tmp/agent-browser/cli && cargo build --release 2>&1",
+    `export PATH="$HOME/.cargo/bin:$PATH" && cd ${REPO_ROOT}/cli && cargo build --release 2>&1`,
   );
   console.log(`  Built (${Math.round((Date.now() - buildStart) / 1000)}s)`);
 
@@ -694,7 +732,7 @@ async function installNativeDaemon(sandbox: SandboxInstance, branch: string) {
   console.log(`  Replacing ${npmBinPath} with native build...`);
   await shell(
     sandbox,
-    `sudo cp /tmp/agent-browser/cli/target/release/agent-browser ${npmBinPath}`,
+    `sudo cp ${REPO_ROOT}/cli/target/release/agent-browser ${npmBinPath}`,
   );
 
   const version = await shell(sandbox, "agent-browser --version 2>&1 || true");
@@ -824,15 +862,7 @@ async function main() {
   console.log(`Iterations: ${config.iterations} (+ ${config.warmup} warmup)`);
   console.log(`vCPUs: ${config.vcpus}\n`);
 
-  console.log("Creating sandbox...");
-  const sandbox = await Sandbox.create({
-    ...credentials,
-    timeout: TIMEOUT_MS,
-    runtime: "node22",
-    networkPolicy: "allow-all" as const,
-    resources: { vcpus: config.vcpus },
-  });
-  console.log(`Sandbox: ${sandbox.sandboxId}`);
+  const sandbox = new LocalMachine();
 
   try {
     await installChromiumDeps(sandbox);
@@ -889,12 +919,7 @@ async function main() {
     console.error(`\nFatal error: ${message}`);
     process.exit(1);
   } finally {
-    try {
-      await sandbox.stop();
-      console.log("\nSandbox stopped.");
-    } catch {
-      console.warn("Warning: failed to stop sandbox.");
-    }
+    // Local execution: nothing to tear down.
   }
 }
 
