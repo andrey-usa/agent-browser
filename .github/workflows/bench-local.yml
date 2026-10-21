@@ -1,0 +1,49 @@
+name: bench-local
+
+# Local rehost of benchmarks/bench.ts (Node.js daemon vs Rust native
+# daemon) on GitHub runners: one job per scenario, each job provisions
+# both daemons and uploads its results.json.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [bench-local]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: bench (${{ matrix.scenario }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - navigate
+          - snapshot
+          - screenshot
+          - evaluate
+          - click
+          - fill
+          - agent-loop
+          - full-workflow
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run benchmark for one scenario
+        working-directory: benchmarks
+        run: |
+          npm install --no-audit --no-fund
+          npx tsx bench.ts --scenario "${{ matrix.scenario }}" --json
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.scenario }}
+          path: benchmarks/results.json
+          if-no-files-found: warn
